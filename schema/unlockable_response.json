@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "UnlockableResponse",
+  "type": "object",
+  "required": [
+    "unlockable"
+  ],
+  "properties": {
+    "unlockable": {
+      "type": "boolean"
+    }
+  }
+}

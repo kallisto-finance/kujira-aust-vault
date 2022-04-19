@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ConfigResponse",
+  "type": "object",
+  "required": [
+    "anchor_liquidation_queue",
+    "astroport_router",
+    "collateral_token",
+    "lock_period",
+    "owner",
+    "paused",
+    "price_oracle",
+    "swap_wallet",
+    "withdraw_lock"
+  ],
+  "properties": {
+    "anchor_liquidation_queue": {
+      "type": "string"
+    },
+    "astroport_router": {
+      "type": "string"
+    },
+    "collateral_token": {
+      "type": "string"
+    },
+    "lock_period": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    },
+    "owner": {
+      "type": "string"
+    },
+    "paused": {
+      "type": "boolean"
+    },
+    "price_oracle": {
+      "type": "string"
+    },
+    "swap_wallet": {
+      "type": "string"
+    },
+    "withdraw_lock": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0.0
+    }
+  }
+}
