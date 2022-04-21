@@ -19,10 +19,10 @@ use crate::error::ContractError;
 use crate::msg::AssetInfo::{NativeToken, Token};
 use crate::msg::SwapOperation::{AstroSwap, NativeSwap};
 use crate::msg::{
-    ActivatableResponse, BalanceResponse, BidsResponse, ClaimableResponse, ConfigResponse,
-    Cw20BalanceResponse, ExecuteMsg, ExternalMsg, ExternalQueryMsg, InfoResponse, InstantiateMsg,
-    PermissionResponse, PriceResponse, QueryMsg, TimestampResponse, TotalCapResponse,
-    UnlockableResponse,
+    BalanceResponse, BidStrategy, ClaimableResponse, ConfigResponse, CumulativeLoanAmount,
+    Cw20BalanceResponse, EpochStateResponse, ExecuteMsg, ExternalMsg, ExternalQueryMsg,
+    InfoResponse, InstantiateMsg, KujiraBidsResponse, PermissionResponse, PriceResponse, QueryMsg,
+    TimestampResponse, TotalCapResponse, UnlockableResponse,
 };
 use crate::state::{
     Permission, State, TokenRecord, BALANCES, CLAIM_LIST, LAST_DEPOSIT, PERMISSIONS, STATE,
@@ -45,9 +45,6 @@ pub fn instantiate(
         locked_b_luna: Uint128::zero(),
         swap_wallet: msg.swap_wallet.clone(),
         paused: false,
-        anchor_liquidation_queue: msg
-            .anchor_liquidation_queue
-            .unwrap_or_else(|| Addr::unchecked("terra1e25zllgag7j9xsun3me4stnye2pcg66234je3u")),
         collateral_token: msg
             .collateral_token
             .unwrap_or_else(|| Addr::unchecked("terra1kc87mu460fwkqte29rquh4hc20m54fxwtsx7gp")),
@@ -57,6 +54,15 @@ pub fn instantiate(
         astroport_router: msg
             .astroport_router
             .unwrap_or_else(|| Addr::unchecked("terra16t7dpwwgx9n3lq6l6te3753lsjqwhxwpday9zx")),
+        anchor_market: msg
+            .anchor_market
+            .unwrap_or_else(|| Addr::unchecked("terra1sepfj7s0aeg5967uxnfk4thzlerrsktkpelm5s")),
+        a_ust: msg
+            .a_ust
+            .unwrap_or_else(|| Addr::unchecked("terra1hzh9vpxhsk8253se0vv5jj6etdvxu3nv8z07zu")),
+        kujira_a_ust_vault: msg
+            .kujira_a_ust_vault
+            .unwrap_or_else(|| Addr::unchecked("terra13nk2cjepdzzwfqy740pxzpe3x75pd6g0grxm2z")),
         lock_period: msg.lock_period.unwrap_or(14 * 24 * 60 * 60),
         withdraw_lock: msg.withdraw_lock.unwrap_or(60 * 60),
     };
@@ -89,8 +95,6 @@ pub fn execute(
         ExecuteMsg::WithdrawUst { share } => withdraw_ust(deps, env, info, share),
         // Withdraw bLuna from Vault
         ExecuteMsg::WithdrawBLuna { share } => withdraw_b_luna(deps, env, info, share),
-        // Activate all bids
-        ExecuteMsg::ActivateBid {} => activate_bid(deps, env, info),
         // Submit bid with amount and premium slot from service
         // Only owner can execute
         ExecuteMsg::SubmitBid {
@@ -124,18 +128,38 @@ pub fn execute(
 }
 
 fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
-    // Only one coin
-    if info.funds.len() != 1 {
-        return Err(Invalidate {});
-    }
-    let mut share: Uint128 = info.funds[0].amount;
-    // Only UST and non-zero amount
-    if info.funds[0].denom != "uusd" || share.is_zero() {
-        return Err(Invalidate {});
-    }
     let mut state = STATE.load(deps.storage)?;
     if state.paused {
         return Err(Paused {});
+    }
+    if info.funds.is_empty() {
+        let uusd_balance = deps
+            .querier
+            .query_balance(&env.contract.address, "uusd")?
+            .amount;
+        return if uusd_balance.is_zero() {
+            Err(Insufficient {})
+        } else {
+            Ok(Response::new()
+                .add_attributes(vec![
+                    attr("action", "deposit_ust_anchor"),
+                    attr("from", info.sender),
+                    attr("amount", uusd_balance.to_string()),
+                ])
+                .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: state.anchor_market.to_string(),
+                    msg: to_binary(&ExternalMsg::DepositStable {})?,
+                    funds: vec![Coin {
+                        denom: "uusd".to_string(),
+                        amount: uusd_balance,
+                    }],
+                })))
+        };
+    }
+    let mut share: Uint128 = info.funds[0].amount;
+    // Only UST and non-zero amount
+    if info.funds.len() != 1 || info.funds[0].denom != "uusd" || share.is_zero() {
+        return Err(Invalidate {});
     }
     let msg_sender = info.sender.to_string().to_lowercase();
     LAST_DEPOSIT.save(
@@ -144,11 +168,18 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         &env.block.time,
     )?;
     // UST in vault
-    let mut usd_balance = deps
+    let uusd_balance = deps
         .querier
         .query_balance(&env.contract.address, "uusd")?
-        .amount
-        - share;
+        .amount;
+    let mut usd_balance = uusd_balance - share;
+    let a_ust_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
+        state.a_ust.to_string(),
+        &ExternalQueryMsg::Balance {
+            address: env.contract.address.to_string(),
+        },
+    )?;
+    let mut a_ust_balance = a_ust_balance_response.balance;
     // bLuna in vault
     let b_luna_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
         state.collateral_token.to_string(),
@@ -157,11 +188,11 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         },
     )?;
     let mut b_luna_balance = b_luna_balance_response.balance;
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
+    let mut start_after: Option<u64> = Some(0u64);
     // Iterate all valid bids
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -170,16 +201,30 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
             },
         )?;
         for item in &res.bids {
-            // Waiting UST for liquidation
-            usd_balance += Uint128::try_from(item.amount)?;
-            // Pending bLuna in Anchor
-            b_luna_balance += Uint128::try_from(item.pending_liquidated_collateral)?;
+            a_ust_balance += item.amount;
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                // Waiting UST for liquidation
+                usd_balance += Uint128::try_from(proxied_bid.amount)?;
+                // Pending bLuna in Anchor
+                b_luna_balance += Uint128::try_from(proxied_bid.pending_liquidated_collateral)?;
+            }
         }
         if res.bids.len() < 31 {
             break;
         }
         start_after = Some(res.bids.last().unwrap().idx);
     }
+
+    let epoch_state_response: EpochStateResponse = deps.querier.query_wasm_smart(
+        state.anchor_market.to_string(),
+        &ExternalQueryMsg::EpochState {
+            block_height: Some(env.block.height),
+            distributed_interest: None,
+        },
+    )?;
+
+    let a_terra_exchange_rate = epoch_state_response.exchange_rate;
+
     // Fetch bLuna price from oracle
     let price_response: PriceResponse = deps.querier.query_wasm_smart(
         state.price_oracle.to_string(),
@@ -189,7 +234,9 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         },
     )?;
     let price = price_response.rate;
-    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))? + usd_balance;
+    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))?
+        + Uint128::try_from(Uint256::from(a_ust_balance).mul(a_terra_exchange_rate))?
+        + usd_balance;
     if !state.total_supply.is_zero() {
         if total_cap.is_zero() {
             return Err(DivideByZeroError {});
@@ -203,12 +250,21 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
         deps.api.addr_canonicalize(&msg_sender)?.as_slice(),
         |balance| -> StdResult<_> { Ok(balance.unwrap_or_default() + share) },
     )?;
-    Ok(Response::new().add_attributes(vec![
-        attr("action", "deposit"),
-        attr("from", info.sender),
-        attr("amount", info.funds[0].amount),
-        attr("share", share),
-    ]))
+    Ok(Response::new()
+        .add_attributes(vec![
+            attr("action", "deposit"),
+            attr("from", info.sender),
+            attr("amount", info.funds[0].amount),
+            attr("share", share),
+        ])
+        .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
+            contract_addr: state.anchor_market.to_string(),
+            msg: to_binary(&ExternalMsg::DepositStable {})?,
+            funds: vec![Coin {
+                denom: "uusd".to_string(),
+                amount: uusd_balance,
+            }],
+        })))
 }
 
 fn submit_bid(
@@ -243,56 +299,30 @@ fn submit_bid(
                 attr("premium_slot", premium_slot.to_string()),
             ])
             .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
-                contract_addr: state.anchor_liquidation_queue.to_string(),
-                funds: vec![Coin::new(amount.u128(), "uusd")],
-                msg: to_binary(&ExternalMsg::SubmitBid {
-                    collateral_token: state.collateral_token.to_string(),
-                    premium_slot,
+                contract_addr: state.a_ust.to_string(),
+                msg: to_binary(&ExternalMsg::Send {
+                    contract: state.kujira_a_ust_vault.to_string(),
+                    amount,
+                    msg: to_binary(&ExternalMsg::SubmitBid {
+                        collateral_token: state.collateral_token.to_string(),
+                        premium_slot,
+                        strategy: BidStrategy {
+                            activate_at: CumulativeLoanAmount {
+                                ltv: 99,
+                                cumulative_value: Uint256::from(1_000_000_000_000u128),
+                            },
+                            deactivate_at: CumulativeLoanAmount {
+                                ltv: 99,
+                                cumulative_value: Uint256::from(100_000_000_000u128),
+                            },
+                        },
+                    })?,
                 })?,
+                funds: vec![],
             })))
     } else {
         Err(Insufficient {})
     }
-}
-
-fn activate_bid(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, ContractError> {
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
-    let mut bids_idx = Vec::new();
-    let state = STATE.load(deps.storage)?;
-    loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
-            &ExternalQueryMsg::BidsByUser {
-                collateral_token: state.collateral_token.to_string(),
-                bidder: env.contract.address.to_string(),
-                start_after,
-                limit: Some(31),
-            },
-        )?;
-        for item in &res.bids {
-            if let Some(wait_end) = item.wait_end {
-                if wait_end < env.block.time.seconds() {
-                    bids_idx.push(item.idx);
-                } else {
-                    break;
-                }
-            }
-        }
-        if res.bids.len() < 31 {
-            break;
-        }
-        start_after = Some(res.bids.last().unwrap().idx);
-    }
-    Ok(Response::new()
-        .add_attributes(vec![attr("action", "activate"), attr("from", info.sender)])
-        .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: state.anchor_liquidation_queue.to_string(),
-            funds: vec![],
-            msg: to_binary(&ExternalMsg::ActivateBids {
-                collateral_token: state.collateral_token.to_string(),
-                bids_idx: Some(bids_idx),
-            })?,
-        })))
 }
 
 fn withdraw_ust(
@@ -320,11 +350,18 @@ fn withdraw_ust(
         deps.api.addr_canonicalize(&msg_sender)?.as_slice(),
         |balance| -> StdResult<_> { Ok(balance.unwrap_or_default().checked_sub(share)?) },
     )?;
-    let uusd_balance = deps
+    let mut uusd_balance = deps
         .querier
         .query_balance(&env.contract.address, "uusd")?
         .amount;
     let mut usd_balance = uusd_balance;
+    let a_ust_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
+        state.a_ust.to_string(),
+        &ExternalQueryMsg::Balance {
+            address: env.contract.address.to_string(),
+        },
+    )?;
+    let mut a_ust_balance = a_ust_balance_response.balance;
     let b_luna_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
         state.collateral_token.to_string(),
         &ExternalQueryMsg::Balance {
@@ -332,10 +369,10 @@ fn withdraw_ust(
         },
     )?;
     let mut b_luna_balance = b_luna_balance_response.balance;
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
+    let mut start_after: Option<u64> = Some(0u64);
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -344,14 +381,32 @@ fn withdraw_ust(
             },
         )?;
         for item in &res.bids {
-            usd_balance += Uint128::try_from(item.amount)?;
-            b_luna_balance += Uint128::try_from(item.pending_liquidated_collateral)?;
+            a_ust_balance += item.amount;
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                usd_balance += Uint128::try_from(proxied_bid.amount)?;
+                b_luna_balance += Uint128::try_from(proxied_bid.pending_liquidated_collateral)?;
+            }
         }
         if res.bids.len() < 31 {
             break;
         }
         start_after = Some(res.bids.last().unwrap().idx);
     }
+
+    let epoch_state_response: EpochStateResponse = deps.querier.query_wasm_smart(
+        state.anchor_market.to_string(),
+        &ExternalQueryMsg::EpochState {
+            block_height: Some(env.block.height),
+            distributed_interest: None,
+        },
+    )?;
+
+    let a_terra_exchange_rate = epoch_state_response.exchange_rate;
+    let a_terra_exchange_rate = Decimal::from_ratio(
+        Uint128::try_from(a_terra_exchange_rate.numerator())?,
+        Uint128::try_from(a_terra_exchange_rate.denominator())?,
+    );
+
     let price_response: PriceResponse = deps.querier.query_wasm_smart(
         state.price_oracle.to_string(),
         &ExternalQueryMsg::Price {
@@ -360,8 +415,11 @@ fn withdraw_ust(
         },
     )?;
     let price = price_response.rate;
+
     // Calculate total cap
-    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))? + usd_balance;
+    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))?
+        + a_ust_balance.mul(a_terra_exchange_rate)
+        + usd_balance;
 
     // Calculate exact amount from share and total cap
     let withdraw_cap = total_cap * share / state.total_supply;
@@ -389,11 +447,12 @@ fn withdraw_ust(
     } else {
         // Retract bids for insufficient UST in vault
         let mut messages = vec![];
-        usd_balance = withdraw_cap - uusd_balance;
-        start_after = Some(Uint128::zero());
+        let mut remaining_usd_balance = withdraw_cap - uusd_balance;
+        a_ust_balance = a_ust_balance_response.balance;
+        start_after = Some(0u64);
         loop {
-            let res: BidsResponse = deps.querier.query_wasm_smart(
-                state.anchor_liquidation_queue.to_string(),
+            let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+                state.kujira_a_ust_vault.to_string(),
                 &ExternalQueryMsg::BidsByUser {
                     collateral_token: state.collateral_token.to_string(),
                     bidder: env.contract.address.to_string(),
@@ -402,50 +461,71 @@ fn withdraw_ust(
                 },
             )?;
             for item in &res.bids {
-                if !item.amount.is_zero() {
-                    if item.amount < usd_balance.into() {
-                        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-                            contract_addr: state.anchor_liquidation_queue.to_string(),
-                            msg: to_binary(&ExternalMsg::RetractBid {
-                                bid_idx: item.idx,
-                                amount: None,
-                            })?,
-                            funds: vec![],
-                        }));
-                        usd_balance -= Uint128::try_from(item.amount)?;
+                messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                    contract_addr: state.kujira_a_ust_vault.to_string(),
+                    msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
+                    funds: vec![],
+                }));
+                a_ust_balance += item.amount;
+                let worth = item.amount.mul(a_terra_exchange_rate);
+                if worth < remaining_usd_balance {
+                    remaining_usd_balance -= worth;
+                } else {
+                    remaining_usd_balance = Uint128::zero();
+                    break;
+                }
+                if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                    if proxied_bid.amount < remaining_usd_balance.into() {
+                        remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
                     } else {
-                        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-                            contract_addr: state.anchor_liquidation_queue.to_string(),
-                            msg: to_binary(&ExternalMsg::RetractBid {
-                                bid_idx: item.idx,
-                                amount: Some(usd_balance.into()),
-                            })?,
-                            funds: vec![],
-                        }));
-                        usd_balance = Uint128::zero();
+                        remaining_usd_balance = Uint128::zero();
                         break;
                     }
+                    uusd_balance += Uint128::try_from(proxied_bid.amount)?;
                 }
             }
-            if usd_balance.is_zero() || res.bids.len() < 31 {
+            if remaining_usd_balance.is_zero() || res.bids.len() < 31 {
                 break;
             }
             start_after = Some(res.bids.last().unwrap().idx);
         }
-        if withdraw_cap > usd_balance {
+        // Redeem aUST
+        if !a_ust_balance.is_zero() {
+            messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                contract_addr: state.a_ust.to_string(),
+                msg: to_binary(&ExternalMsg::Send {
+                    contract: state.anchor_market.to_string(),
+                    amount: a_ust_balance,
+                    msg: to_binary(&ExternalMsg::RedeemStable {})?,
+                })?,
+                funds: vec![],
+            }));
+            uusd_balance += a_ust_balance.mul(a_terra_exchange_rate);
+        }
+        if uusd_balance >= withdraw_cap {
             messages.push(CosmosMsg::Bank(BankMsg::Send {
                 to_address: msg_sender.clone(),
                 amount: vec![Coin {
                     denom: "uusd".to_string(),
-                    amount: withdraw_cap - usd_balance,
+                    amount: withdraw_cap,
                 }],
             }));
         }
         let mut unlocked_b_luna = Uint128::zero();
-        if !usd_balance.is_zero() {
-            let mut b_luna_withdraw = b_luna_balance * share * usd_balance
+        if !remaining_usd_balance.is_zero() {
+            if !uusd_balance.is_zero() {
+                messages.push(CosmosMsg::Bank(BankMsg::Send {
+                    to_address: msg_sender.clone(),
+                    amount: vec![Coin {
+                        denom: "uusd".to_string(),
+                        amount: uusd_balance,
+                    }],
+                }));
+            }
+            let mut b_luna_withdraw = b_luna_balance * share * remaining_usd_balance
                 / withdraw_cap
-                / (state.total_supply - share * (withdraw_cap - usd_balance) / withdraw_cap);
+                / (state.total_supply
+                    - share * (withdraw_cap - remaining_usd_balance) / withdraw_cap);
             if !b_luna_withdraw.is_zero() {
                 // swap on wallet
                 messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
@@ -541,6 +621,13 @@ fn withdraw_b_luna(
         .query_balance(&env.contract.address, "uusd")?
         .amount;
     let mut usd_balance = uusd_balance;
+    let a_ust_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
+        state.a_ust.to_string(),
+        &ExternalQueryMsg::Balance {
+            address: env.contract.address.to_string(),
+        },
+    )?;
+    let mut a_ust_balance = a_ust_balance_response.balance;
     let b_luna_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
         state.collateral_token.to_string(),
         &ExternalQueryMsg::Balance {
@@ -549,10 +636,10 @@ fn withdraw_b_luna(
     )?;
 
     let mut b_luna_balance = b_luna_balance_response.balance;
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
+    let mut start_after: Option<u64> = Some(0u64);
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -561,14 +648,25 @@ fn withdraw_b_luna(
             },
         )?;
         for item in &res.bids {
-            usd_balance += Uint128::try_from(item.amount)?;
-            b_luna_balance += Uint128::try_from(item.pending_liquidated_collateral)?;
+            a_ust_balance += item.amount;
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                usd_balance += Uint128::try_from(proxied_bid.amount)?;
+                b_luna_balance += Uint128::try_from(proxied_bid.pending_liquidated_collateral)?;
+            }
         }
         if res.bids.len() < 31 {
             break;
         }
         start_after = Some(res.bids.last().unwrap().idx);
     }
+    let epoch_state_response: EpochStateResponse = deps.querier.query_wasm_smart(
+        state.anchor_market.to_string(),
+        &ExternalQueryMsg::EpochState {
+            block_height: Some(env.block.height),
+            distributed_interest: None,
+        },
+    )?;
+    let a_terra_exchange_rate = epoch_state_response.exchange_rate;
     let price_response: PriceResponse = deps.querier.query_wasm_smart(
         state.price_oracle.to_string(),
         &ExternalQueryMsg::Price {
@@ -578,8 +676,14 @@ fn withdraw_b_luna(
     )?;
     let price = price_response.rate;
     // Calculate total cap
-    let total_cap =
-        b_luna_balance + Uint128::try_from(Uint256::from(usd_balance).mul(price.inv().unwrap()))?;
+    let total_cap = b_luna_balance
+        + Uint128::try_from(
+            Uint256::from(
+                usd_balance
+                    + Uint128::try_from(Uint256::from(a_ust_balance).mul(a_terra_exchange_rate))?,
+            )
+            .mul(price.inv().unwrap()),
+        )?;
     // Calculate exact amount from share and total cap
     let withdraw_cap = total_cap * share / state.total_supply;
 
@@ -613,11 +717,12 @@ fn claim_liquidation(
     info: MessageInfo,
 ) -> Result<Response, ContractError> {
     let mut b_luna_balance = Uint128::zero();
-    let mut start_after = Some(Uint128::zero());
+    let mut start_after = Some(0u64);
     let mut state = STATE.load(deps.storage)?;
+    let mut bids_idx = vec![];
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -626,7 +731,12 @@ fn claim_liquidation(
             },
         )?;
         for item in &res.bids {
-            b_luna_balance += Uint128::try_from(item.pending_liquidated_collateral)?;
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                if !proxied_bid.pending_liquidated_collateral.is_zero() {
+                    b_luna_balance += Uint128::try_from(proxied_bid.pending_liquidated_collateral)?;
+                    bids_idx.push(item.idx);
+                }
+            }
         }
         if res.bids.len() < 31 {
             break;
@@ -655,10 +765,10 @@ fn claim_liquidation(
     STATE.save(deps.storage, &state)?;
     Ok(Response::new()
         .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
-            contract_addr: state.anchor_liquidation_queue.to_string(),
+            contract_addr: state.kujira_a_ust_vault.to_string(),
             msg: to_binary(&ExternalMsg::ClaimLiquidations {
-                collateral_token: state.collateral_token.to_string(),
-                bids_idx: None,
+                collateral_token: state.collateral_token,
+                bids_idx,
             })?,
             funds: vec![],
         }))
@@ -756,33 +866,32 @@ fn swap(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contract
     if swap_amount.is_zero() {
         return Err(Insufficient {});
     }
-    let msg = ExternalMsg::Send {
-        contract: state.astroport_router.to_string(),
-        amount: swap_amount,
-        msg: to_binary(&ExternalMsg::ExecuteSwapOperations {
-            operations: vec![
-                AstroSwap {
-                    offer_asset_info: Token {
-                        contract_addr: state.collateral_token.clone(),
-                    },
-                    ask_asset_info: NativeToken {
-                        denom: "uluna".to_string(),
-                    },
-                },
-                NativeSwap {
-                    offer_denom: "uluna".to_string(),
-                    ask_denom: "uusd".to_string(),
-                },
-            ],
-            minimum_receive: None,
-            to: None,
-            max_spread: Some(Decimal::from_str("0.5")?),
-        })?,
-    };
     Ok(Response::new()
         .add_message(CosmosMsg::Wasm(WasmMsg::Execute {
             contract_addr: state.collateral_token.to_string(),
-            msg: to_binary(&msg)?,
+            msg: to_binary(&ExternalMsg::Send {
+                contract: state.astroport_router.to_string(),
+                amount: swap_amount,
+                msg: to_binary(&ExternalMsg::ExecuteSwapOperations {
+                    operations: vec![
+                        AstroSwap {
+                            offer_asset_info: Token {
+                                contract_addr: state.collateral_token,
+                            },
+                            ask_asset_info: NativeToken {
+                                denom: "uluna".to_string(),
+                            },
+                        },
+                        NativeSwap {
+                            offer_denom: "uluna".to_string(),
+                            ask_denom: "uusd".to_string(),
+                        },
+                    ],
+                    minimum_receive: None,
+                    to: None,
+                    max_spread: Some(Decimal::from_str("0.5")?),
+                })?,
+            })?,
             funds: vec![],
         }))
         .add_attributes(vec![
@@ -869,8 +978,6 @@ pub fn query(deps: Deps, env: Env, msg: QueryMsg) -> StdResult<Binary> {
         QueryMsg::Balance { address } => to_binary(&query_balance(deps, address)?),
         // Get total cap in vault and anchor
         QueryMsg::TotalCap {} => to_binary(&query_total_cap(deps, env)?),
-        // Return true if activate is needed
-        QueryMsg::Activatable {} => to_binary(&query_activatable(deps, env)?),
         // Return true if liquidate is needed
         QueryMsg::Claimable {} => to_binary(&query_claimable(deps, env)?),
         QueryMsg::Permission { address } => to_binary(&query_permission(deps, address)?),
@@ -895,12 +1002,14 @@ fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
         owner: state.owner.to_string(),
         paused: state.paused,
         swap_wallet: state.swap_wallet.to_string(),
-        anchor_liquidation_queue: state.anchor_liquidation_queue.to_string(),
         collateral_token: state.collateral_token.to_string(),
         price_oracle: state.price_oracle.to_string(),
         astroport_router: state.astroport_router.to_string(),
         lock_period: state.lock_period,
         withdraw_lock: state.withdraw_lock,
+        anchor_market: state.anchor_market.to_string(),
+        a_ust: state.a_ust.to_string(),
+        kujira_a_ust_vault: state.kujira_a_ust_vault.to_string(),
     })
 }
 
@@ -918,6 +1027,13 @@ fn query_total_cap(deps: Deps, env: Env) -> StdResult<TotalCapResponse> {
         .query_balance(&env.contract.address, "uusd")?
         .amount;
     let state = STATE.load(deps.storage)?;
+    let a_ust_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
+        state.a_ust.to_string(),
+        &ExternalQueryMsg::Balance {
+            address: env.contract.address.to_string(),
+        },
+    )?;
+    let mut a_ust_balance = a_ust_balance_response.balance;
     let b_luna_balance_response: Cw20BalanceResponse = deps.querier.query_wasm_smart(
         state.collateral_token.to_string(),
         &ExternalQueryMsg::Balance {
@@ -925,10 +1041,10 @@ fn query_total_cap(deps: Deps, env: Env) -> StdResult<TotalCapResponse> {
         },
     )?;
     let mut b_luna_balance = b_luna_balance_response.balance;
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
+    let mut start_after: Option<u64> = Some(0u64);
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -937,14 +1053,25 @@ fn query_total_cap(deps: Deps, env: Env) -> StdResult<TotalCapResponse> {
             },
         )?;
         for item in &res.bids {
-            usd_balance += Uint128::try_from(item.amount)?;
-            b_luna_balance += Uint128::try_from(item.pending_liquidated_collateral)?;
+            a_ust_balance += item.amount;
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                usd_balance += Uint128::try_from(proxied_bid.amount)?;
+                b_luna_balance += Uint128::try_from(proxied_bid.pending_liquidated_collateral)?;
+            }
         }
         if res.bids.len() < 31 {
             break;
         }
         start_after = Some(res.bids.last().unwrap().idx);
     }
+    let epoch_state_response: EpochStateResponse = deps.querier.query_wasm_smart(
+        state.anchor_market,
+        &ExternalQueryMsg::EpochState {
+            block_height: Some(env.block.height),
+            distributed_interest: None,
+        },
+    )?;
+    let a_terra_exchange_rate = epoch_state_response.exchange_rate;
     let price_response: PriceResponse = deps.querier.query_wasm_smart(
         state.price_oracle.to_string(),
         &ExternalQueryMsg::Price {
@@ -953,42 +1080,18 @@ fn query_total_cap(deps: Deps, env: Env) -> StdResult<TotalCapResponse> {
         },
     )?;
     let price = price_response.rate;
-    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))? + usd_balance;
+    let total_cap = Uint128::try_from(Uint256::from(b_luna_balance).mul(price))?
+        + Uint128::try_from(Uint256::from(a_ust_balance).mul(a_terra_exchange_rate))?
+        + usd_balance;
     Ok(TotalCapResponse { total_cap })
 }
 
-fn query_activatable(deps: Deps, env: Env) -> StdResult<ActivatableResponse> {
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
-    let state = STATE.load(deps.storage)?;
-    loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
-            &ExternalQueryMsg::BidsByUser {
-                collateral_token: state.collateral_token.to_string(),
-                bidder: env.contract.address.to_string(),
-                start_after,
-                limit: Some(31),
-            },
-        )?;
-        for item in &res.bids {
-            if item.wait_end.is_some() && item.wait_end.unwrap() < env.block.time.seconds() {
-                return Ok(ActivatableResponse { activatable: true });
-            }
-        }
-        if res.bids.len() < 31 {
-            break;
-        }
-        start_after = Some(res.bids.last().unwrap().idx);
-    }
-    Ok(ActivatableResponse { activatable: false })
-}
-
 fn query_claimable(deps: Deps, env: Env) -> StdResult<ClaimableResponse> {
-    let mut start_after: Option<Uint128> = Some(Uint128::zero());
+    let mut start_after: Option<u64> = Some(0u64);
     let state = STATE.load(deps.storage)?;
     loop {
-        let res: BidsResponse = deps.querier.query_wasm_smart(
-            state.anchor_liquidation_queue.to_string(),
+        let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+            state.kujira_a_ust_vault.to_string(),
             &ExternalQueryMsg::BidsByUser {
                 collateral_token: state.collateral_token.to_string(),
                 bidder: env.contract.address.to_string(),
@@ -997,8 +1100,10 @@ fn query_claimable(deps: Deps, env: Env) -> StdResult<ClaimableResponse> {
             },
         )?;
         for item in &res.bids {
-            if !item.pending_liquidated_collateral.is_zero() {
-                return Ok(ClaimableResponse { claimable: true });
+            if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                if !proxied_bid.pending_liquidated_collateral.is_zero() {
+                    return Ok(ClaimableResponse { claimable: true });
+                }
             }
         }
         if res.bids.len() < 31 {

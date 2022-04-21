@@ -11,10 +11,12 @@ pub struct State {
     pub locked_b_luna: Uint128,
     pub swap_wallet: Addr,
     pub paused: bool,
-    pub anchor_liquidation_queue: Addr,
     pub collateral_token: Addr,
     pub price_oracle: Addr,
     pub astroport_router: Addr,
+    pub anchor_market: Addr,
+    pub a_ust: Addr,
+    pub kujira_a_ust_vault: Addr,
     pub lock_period: u64,
     pub withdraw_lock: u64,
 }

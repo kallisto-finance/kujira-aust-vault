@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 pub struct InstantiateMsg {
     pub owner: Addr,
     pub swap_wallet: Addr,
-    pub anchor_liquidation_queue: Option<Addr>,
     pub collateral_token: Option<Addr>,
     pub price_oracle: Option<Addr>,
     pub astroport_router: Option<Addr>,
+    pub anchor_market: Option<Addr>,
+    pub a_ust: Option<Addr>,
+    pub kujira_a_ust_vault: Option<Addr>,
     pub lock_period: Option<u64>,
     pub withdraw_lock: Option<u64>,
 }
@@ -25,7 +27,6 @@ pub enum ExecuteMsg {
     WithdrawBLuna {
         share: Uint128,
     },
-    ActivateBid {},
     SubmitBid {
         amount: Uint128,
         premium_slot: u8,
@@ -49,21 +50,17 @@ pub enum ExecuteMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ExternalMsg {
-    ActivateBids {
-        collateral_token: String,
-        bids_idx: Option<Vec<Uint128>>,
-    },
     SubmitBid {
         collateral_token: String,
         premium_slot: u8,
+        strategy: BidStrategy,
     },
     RetractBid {
-        bid_idx: Uint128,
-        amount: Option<Uint256>,
+        bid_idx: u64,
     },
     ClaimLiquidations {
-        collateral_token: String,
-        bids_idx: Option<Vec<Uint128>>,
+        collateral_token: Addr,
+        bids_idx: Vec<u64>,
     },
     Transfer {
         recipient: String,
@@ -83,6 +80,8 @@ pub enum ExternalMsg {
     Swap {
         to: Addr,
     },
+    DepositStable {},
+    RedeemStable {},
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -93,7 +92,6 @@ pub enum QueryMsg {
     Config {},
     Balance { address: String },
     TotalCap {},
-    Activatable {},
     Claimable {},
     Permission { address: String },
     Unlockable {},
@@ -112,12 +110,14 @@ pub struct ConfigResponse {
     pub owner: String,
     pub paused: bool,
     pub swap_wallet: String,
-    pub anchor_liquidation_queue: String,
     pub collateral_token: String,
     pub price_oracle: String,
     pub astroport_router: String,
     pub lock_period: u64,
     pub withdraw_lock: u64,
+    pub anchor_market: String,
+    pub a_ust: String,
+    pub kujira_a_ust_vault: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -160,23 +160,22 @@ pub enum ExternalQueryMsg {
     BidsByUser {
         collateral_token: String,
         bidder: String,
-        start_after: Option<Uint128>,
+        start_after: Option<u64>,
         limit: Option<u8>,
     },
     Price {
         base: String,
         quote: String,
     },
+    EpochState {
+        block_height: Option<u64>,
+        distributed_interest: Option<Uint256>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
 pub struct Cw20BalanceResponse {
     pub balance: Uint128,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
-pub struct BidsResponse {
-    pub bids: Vec<BidResponse>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -224,4 +223,40 @@ pub enum SwapOperation {
 pub enum AssetInfo {
     Token { contract_addr: Addr },
     NativeToken { denom: String },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct EpochStateResponse {
+    pub exchange_rate: Decimal256,
+    pub aterra_supply: Uint256,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct KujiraBidsResponse {
+    pub bids: Vec<KujiraBidResponse>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct KujiraBidResponse {
+    pub collateral_token: Addr,
+    pub premium_slot: u8,
+    pub bidder: Addr,
+    pub idx: u64,
+    pub bid_idx: Option<Uint128>,
+    pub strategy: BidStrategy,
+    pub amount: Uint128,
+    pub prev_exchange_rate: Decimal256,
+    pub proxied_bid: Option<BidResponse>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct BidStrategy {
+    pub activate_at: CumulativeLoanAmount,
+    pub deactivate_at: CumulativeLoanAmount,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
+pub struct CumulativeLoanAmount {
+    pub ltv: u8,
+    pub cumulative_value: Uint256,
 }
