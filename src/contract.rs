@@ -100,7 +100,7 @@ pub fn execute(
         ExecuteMsg::SubmitBid {
             amount,
             premium_slot,
-        } => submit_bid(deps, env, info, amount, premium_slot),
+        } => submit_bid(deps, info, amount, premium_slot),
         // Withdraw all liquidated bLuna from Anchor
         ExecuteMsg::ClaimLiquidation {} => claim_liquidation(deps, env, info),
         ExecuteMsg::Unlock {} => unlock(deps, env, info),
@@ -269,7 +269,6 @@ fn deposit(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contr
 
 fn submit_bid(
     deps: DepsMut,
-    env: Env,
     info: MessageInfo,
     amount: Uint128,
     premium_slot: u8,
@@ -285,11 +284,7 @@ fn submit_bid(
     if !permission.submit_bid {
         return Err(Unauthorized {});
     }
-    let usd_balance = deps
-        .querier
-        .query_balance(env.contract.address, "uusd")?
-        .amount;
-    if !amount.is_zero() && usd_balance >= amount {
+    if !amount.is_zero() {
         let state = STATE.load(deps.storage)?;
         Ok(Response::new()
             .add_attributes(vec![
