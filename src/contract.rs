@@ -449,45 +449,55 @@ fn withdraw_ust(
         let mut messages = vec![];
         let mut remaining_usd_balance = withdraw_cap - uusd_balance;
         a_ust_balance = a_ust_balance_response.balance;
-        start_after = Some(0u64);
-        loop {
-            let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
-                state.kujira_a_ust_vault.to_string(),
-                &ExternalQueryMsg::BidsByUser {
-                    collateral_token: state.collateral_token.to_string(),
-                    bidder: env.contract.address.to_string(),
-                    start_after,
-                    limit: Some(31),
-                },
-            )?;
-            for item in &res.bids {
-                messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-                    contract_addr: state.kujira_a_ust_vault.to_string(),
-                    msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
-                    funds: vec![],
-                }));
-                a_ust_balance += item.amount;
-                let worth = item.amount.mul(a_terra_exchange_rate);
-                if worth < remaining_usd_balance {
-                    remaining_usd_balance -= worth;
-                } else {
-                    remaining_usd_balance = Uint128::zero();
-                    break;
-                }
-                if let Some(proxied_bid) = item.proxied_bid.as_ref() {
-                    if proxied_bid.amount < remaining_usd_balance.into() {
-                        remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
+        let uusd_in_a_ust = a_ust_balance.mul(a_terra_exchange_rate.inv().unwrap());
+        if remaining_usd_balance > uusd_in_a_ust {
+            remaining_usd_balance -= uusd_in_a_ust;
+        } else {
+            remaining_usd_balance = Uint128::zero();
+        }
+        if !remaining_usd_balance.is_zero() {
+            start_after = Some(0u64);
+            loop {
+                let res: KujiraBidsResponse = deps.querier.query_wasm_smart(
+                    state.kujira_a_ust_vault.to_string(),
+                    &ExternalQueryMsg::BidsByUser {
+                        collateral_token: state.collateral_token.to_string(),
+                        bidder: env.contract.address.to_string(),
+                        start_after,
+                        limit: Some(31),
+                    },
+                )?;
+                for item in &res.bids {
+                    messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                        contract_addr: state.kujira_a_ust_vault.to_string(),
+                        msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
+                        funds: vec![],
+                    }));
+                    let worth = item.amount.mul(a_terra_exchange_rate);
+                    if worth < remaining_usd_balance {
+                        a_ust_balance += item.amount;
+                        remaining_usd_balance -= worth;
                     } else {
+                        a_ust_balance +=
+                            remaining_usd_balance.mul(a_terra_exchange_rate.inv().unwrap());
                         remaining_usd_balance = Uint128::zero();
                         break;
                     }
-                    uusd_balance += Uint128::try_from(proxied_bid.amount)?;
+                    if let Some(proxied_bid) = item.proxied_bid.as_ref() {
+                        if proxied_bid.amount < remaining_usd_balance.into() {
+                            remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
+                        } else {
+                            remaining_usd_balance = Uint128::zero();
+                            break;
+                        }
+                        uusd_balance += Uint128::try_from(proxied_bid.amount)?;
+                    }
                 }
+                if remaining_usd_balance.is_zero() || res.bids.len() < 31 {
+                    break;
+                }
+                start_after = Some(res.bids.last().unwrap().idx);
             }
-            if remaining_usd_balance.is_zero() || res.bids.len() < 31 {
-                break;
-            }
-            start_after = Some(res.bids.last().unwrap().idx);
         }
         // Redeem aUST
         if !a_ust_balance.is_zero() {
