@@ -120,6 +120,7 @@ pub struct ConfigResponse {
     pub anchor_market: String,
     pub a_ust: String,
     pub kujira_a_ust_vault: String,
+    pub bid_strategy: BidStrategy,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]

@@ -1050,6 +1050,7 @@ fn query_config(deps: Deps) -> StdResult<ConfigResponse> {
         anchor_market: state.anchor_market.to_string(),
         a_ust: state.a_ust.to_string(),
         kujira_a_ust_vault: state.kujira_a_ust_vault.to_string(),
+        bid_strategy: state.bid_strategy,
     })
 }
 
