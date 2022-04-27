@@ -1,6 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::msg::BidStrategy;
 use cosmwasm_std::{Addr, Timestamp, Uint128};
 use cw_storage_plus::{Item, Map, U32Key};
 
@@ -19,6 +20,7 @@ pub struct State {
     pub kujira_a_ust_vault: Addr,
     pub lock_period: u64,
     pub withdraw_lock: u64,
+    pub bid_strategy: BidStrategy,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]

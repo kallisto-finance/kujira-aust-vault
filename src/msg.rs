@@ -15,6 +15,7 @@ pub struct InstantiateMsg {
     pub kujira_a_ust_vault: Option<Addr>,
     pub lock_period: Option<u64>,
     pub withdraw_lock: Option<u64>,
+    pub bid_strategy: Option<BidStrategy>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, JsonSchema)]
@@ -44,6 +45,7 @@ pub enum ExecuteMsg {
         swap_wallet: Option<Addr>,
         lock_period: Option<u64>,
         withdraw_lock: Option<u64>,
+        bid_strategy: Option<BidStrategy>,
     },
 }
 

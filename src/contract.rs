@@ -65,6 +65,16 @@ pub fn instantiate(
             .unwrap_or_else(|| Addr::unchecked("terra13nk2cjepdzzwfqy740pxzpe3x75pd6g0grxm2z")),
         lock_period: msg.lock_period.unwrap_or(14 * 24 * 60 * 60),
         withdraw_lock: msg.withdraw_lock.unwrap_or(60 * 60),
+        bid_strategy: msg.bid_strategy.unwrap_or(BidStrategy {
+            activate_at: CumulativeLoanAmount {
+                ltv: 99,
+                cumulative_value: Uint256::from(1_000_000_000_000u128),
+            },
+            deactivate_at: CumulativeLoanAmount {
+                ltv: 99,
+                cumulative_value: Uint256::from(100_000_000_000u128),
+            },
+        }),
     };
     set_contract_version(deps.storage, CONTRACT_NAME, CONTRACT_VERSION)?;
     STATE.save(deps.storage, &state)?;
@@ -115,6 +125,7 @@ pub fn execute(
             swap_wallet,
             lock_period,
             withdraw_lock,
+            bid_strategy,
         } => update_config(
             deps,
             info,
@@ -123,6 +134,7 @@ pub fn execute(
             swap_wallet,
             lock_period,
             withdraw_lock,
+            bid_strategy,
         ),
     }
 }
@@ -906,6 +918,7 @@ fn swap(deps: DepsMut, env: Env, info: MessageInfo) -> Result<Response, Contract
         ]))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_config(
     deps: DepsMut,
     info: MessageInfo,
@@ -914,6 +927,7 @@ fn update_config(
     swap_wallet: Option<Addr>,
     lock_period: Option<u64>,
     withdraw_lock: Option<u64>,
+    bid_strategy: Option<BidStrategy>,
 ) -> Result<Response, ContractError> {
     let mut state = STATE.load(deps.storage)?;
     if state.owner.to_string().to_lowercase() != info.sender.to_string().to_lowercase() {
@@ -965,6 +979,27 @@ fn update_config(
         if withdraw_lock != state.withdraw_lock {
             state.withdraw_lock = withdraw_lock;
             attributes.push(attr("withdraw_lock", withdraw_lock.to_string()));
+        }
+    }
+    if let Some(bid_strategy) = bid_strategy {
+        if bid_strategy != state.bid_strategy {
+            state.bid_strategy = bid_strategy.clone();
+            attributes.push(attr(
+                "activate_at_ltv",
+                bid_strategy.activate_at.ltv.to_string(),
+            ));
+            attributes.push(attr(
+                "activate_at_cumulative_value",
+                bid_strategy.activate_at.cumulative_value.to_string(),
+            ));
+            attributes.push(attr(
+                "deactivate_at_ltv",
+                bid_strategy.deactivate_at.ltv.to_string(),
+            ));
+            attributes.push(attr(
+                "deactivate_at_cumulative_value",
+                bid_strategy.deactivate_at.cumulative_value.to_string(),
+            ));
         }
     }
     if attributes.len() <= 2 {
