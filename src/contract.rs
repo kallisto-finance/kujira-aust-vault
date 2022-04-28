@@ -313,16 +313,7 @@ fn submit_bid(
                     msg: to_binary(&ExternalMsg::SubmitBid {
                         collateral_token: state.collateral_token.to_string(),
                         premium_slot,
-                        strategy: BidStrategy {
-                            activate_at: CumulativeLoanAmount {
-                                ltv: 99,
-                                cumulative_value: Uint256::from(1_000_000_000_000u128),
-                            },
-                            deactivate_at: CumulativeLoanAmount {
-                                ltv: 99,
-                                cumulative_value: Uint256::from(100_000_000_000u128),
-                            },
-                        },
+                        strategy: state.bid_strategy,
                     })?,
                 })?,
                 funds: vec![],
