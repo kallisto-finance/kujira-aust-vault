@@ -447,7 +447,7 @@ fn withdraw_ust(
         let mut messages = vec![];
         let mut remaining_usd_balance = withdraw_cap - uusd_balance;
         a_ust_balance = a_ust_balance_response.balance;
-        let uusd_in_a_ust = a_ust_balance.mul(a_terra_exchange_rate.inv().unwrap());
+        let uusd_in_a_ust = a_ust_balance.mul(a_terra_exchange_rate);
         if remaining_usd_balance > uusd_in_a_ust {
             remaining_usd_balance -= uusd_in_a_ust;
         } else {
