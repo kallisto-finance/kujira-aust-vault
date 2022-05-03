@@ -473,7 +473,8 @@ fn withdraw_ust(
                                 msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
                                 funds: vec![],
                             }));
-                            a_ust_balance += Uint128::try_from(proxied_bid.amount)?.mul(a_terra_exchange_rate.inv().unwrap());
+                            a_ust_balance += Uint128::try_from(proxied_bid.amount)?
+                                .mul(a_terra_exchange_rate.inv().unwrap());
                             if proxied_bid.amount < remaining_usd_balance.into() {
                                 remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
                             } else {
