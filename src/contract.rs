@@ -489,12 +489,10 @@ fn withdraw_ust(
                             funds: vec![],
                         }));
                         let worth = item.amount.mul(a_terra_exchange_rate);
+                        a_ust_balance += item.amount;
                         if worth < remaining_usd_balance {
-                            a_ust_balance += item.amount;
                             remaining_usd_balance -= worth;
                         } else {
-                            a_ust_balance +=
-                                remaining_usd_balance.mul(a_terra_exchange_rate.inv().unwrap());
                             remaining_usd_balance = Uint128::zero();
                             break;
                         }
