@@ -466,29 +466,37 @@ fn withdraw_ust(
                     },
                 )?;
                 for item in &res.bids {
-                    messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
-                        contract_addr: state.kujira_a_ust_vault.to_string(),
-                        msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
-                        funds: vec![],
-                    }));
-                    let worth = item.amount.mul(a_terra_exchange_rate);
-                    if worth < remaining_usd_balance {
-                        a_ust_balance += item.amount;
-                        remaining_usd_balance -= worth;
-                    } else {
-                        a_ust_balance +=
-                            remaining_usd_balance.mul(a_terra_exchange_rate.inv().unwrap());
-                        remaining_usd_balance = Uint128::zero();
-                        break;
-                    }
                     if let Some(proxied_bid) = item.proxied_bid.as_ref() {
-                        if proxied_bid.amount < remaining_usd_balance.into() {
-                            remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
+                        if !proxied_bid.amount.is_zero() {
+                            messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                                contract_addr: state.kujira_a_ust_vault.to_string(),
+                                msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
+                                funds: vec![],
+                            }));
+                            a_ust_balance += Uint128::try_from(proxied_bid.amount)?.mul(a_terra_exchange_rate.inv().unwrap());
+                            if proxied_bid.amount < remaining_usd_balance.into() {
+                                remaining_usd_balance -= Uint128::try_from(proxied_bid.amount)?;
+                            } else {
+                                remaining_usd_balance = Uint128::zero();
+                                break;
+                            }
+                        }
+                    } else {
+                        messages.push(CosmosMsg::Wasm(WasmMsg::Execute {
+                            contract_addr: state.kujira_a_ust_vault.to_string(),
+                            msg: to_binary(&ExternalMsg::RetractBid { bid_idx: item.idx })?,
+                            funds: vec![],
+                        }));
+                        let worth = item.amount.mul(a_terra_exchange_rate);
+                        if worth < remaining_usd_balance {
+                            a_ust_balance += item.amount;
+                            remaining_usd_balance -= worth;
                         } else {
+                            a_ust_balance +=
+                                remaining_usd_balance.mul(a_terra_exchange_rate.inv().unwrap());
                             remaining_usd_balance = Uint128::zero();
                             break;
                         }
-                        uusd_balance += Uint128::try_from(proxied_bid.amount)?;
                     }
                 }
                 if remaining_usd_balance.is_zero() || res.bids.len() < 31 {
