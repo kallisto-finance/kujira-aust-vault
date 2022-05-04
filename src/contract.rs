@@ -525,18 +525,17 @@ fn withdraw_ust(
                     amount: withdraw_cap,
                 }],
             }));
+        } else if !uusd_balance.is_zero() {
+            messages.push(CosmosMsg::Bank(BankMsg::Send {
+                to_address: msg_sender.clone(),
+                amount: vec![Coin {
+                    denom: "uusd".to_string(),
+                    amount: uusd_balance,
+                }],
+            }));
         }
         let mut unlocked_b_luna = Uint128::zero();
         if !remaining_usd_balance.is_zero() {
-            if !uusd_balance.is_zero() {
-                messages.push(CosmosMsg::Bank(BankMsg::Send {
-                    to_address: msg_sender.clone(),
-                    amount: vec![Coin {
-                        denom: "uusd".to_string(),
-                        amount: uusd_balance,
-                    }],
-                }));
-            }
             let mut b_luna_withdraw = b_luna_balance * share * remaining_usd_balance
                 / withdraw_cap
                 / (state.total_supply
